@@ -56,6 +56,9 @@ const MIN_MATCH_SCORE = 0.4
 const BRAND_BONUS = 0.25
 const BRAND_SEARCH_LIMIT = 48
 const NAME_SEARCH_LIMIT = 12
+/** A candidate is the photographed product only when its name holds most of the printed name words. */
+const MIN_NAME_COVERAGE = 0.8
+const LABEL_NOISE = new Set(['try', 'me'])
 
 function parseRead(content: string | null): LabelRead | null {
   if (!content) return null
@@ -122,6 +125,33 @@ function brandMatches(product: ProductFacts, brands: readonly string[]): boolean
   })
 }
 
+const wordsMeet = (a: string, b: string) =>
+  a === b || (b.length >= 4 && a.startsWith(b)) || (a.length >= 4 && b.startsWith(a))
+
+/**
+ * How much of the product name the label and the candidate share, without the brand: same-brand products share the
+ * brand and generic words ("cream", "toner"), and only the name tells them apart. With a printed name, the share of
+ * its words found in the candidate; without one, the share of the candidate's words seen anywhere on the label.
+ */
+export function nameCoverage(product: ProductFacts, read: LabelRead): number {
+  // Only brand words are dropped: the printed brand and the candidate's own brand. A Latin name may be the whole
+  // product name ("Mellow Oat Calming Cream"), so it is never treated as a brand wholesale.
+  const brandWords = new Set([...latinWords(read.brand), ...searchTokens(product.brand)])
+  const distinct = (words: string[]) =>
+    [...new Set(words)].filter((word) => !brandWords.has(word) && !LABEL_NOISE.has(word))
+  const printedName = distinct(latinWords([read.productName, ...read.latinNames].filter(Boolean).join(' ')))
+  const candidateWords = searchTokens(`${product.brand} ${product.name}`)
+  if (printedName.length) {
+    const found = printedName.filter((word) => candidateWords.some((candidate) => wordsMeet(candidate, word)))
+    return found.length / printedName.length
+  }
+  const nameWords = candidateWords.filter((word) => !brandWords.has(word))
+  if (!nameWords.length) return 0
+  const labelWords = latinWords(read.visibleText.join(' '))
+  const seen = nameWords.filter((word) => labelWords.some((label) => wordsMeet(word, label)))
+  return seen.length / nameWords.length
+}
+
 export function scoreCandidate(product: ProductFacts, read: LabelRead): LabelCandidate {
   const labelWords = new Set(
     searchTokens([read.brand, read.productName, ...read.latinNames, ...read.visibleText].filter(Boolean).join(' ')),
@@ -181,9 +211,10 @@ export async function matchLabel(catalog: CatalogPort, read: LabelRead | null, l
   for (const product of results.flat()) if (!unique.has(product.id)) unique.set(product.id, product)
 
   const candidates = [...unique.values()]
-    .map((product) => scoreCandidate(product, read))
-    .filter((candidate) => candidate.score >= MIN_MATCH_SCORE)
-    .sort((a, b) => b.score - a.score)
+    .map((product) => ({ candidate: scoreCandidate(product, read), coverage: nameCoverage(product, read) }))
+    .filter(({ candidate, coverage }) => candidate.score >= MIN_MATCH_SCORE && coverage >= MIN_NAME_COVERAGE)
+    .sort((a, b) => b.coverage - a.coverage || b.candidate.score - a.candidate.score)
     .slice(0, limit)
+    .map(({ candidate }) => candidate)
   return { status: candidates.length ? 'matched' : 'no-match', candidates }
 }

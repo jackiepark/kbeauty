@@ -2,13 +2,12 @@ import { MetaModelError } from '../meta/client.js'
 import {
   type ChatMessage,
   type ChatModel,
-  type ChatRequest,
   type ChatResponse,
   type ChatUsage,
   EMPTY_USAGE,
   addUsage,
 } from '../meta/types.js'
-import { MAX_RECOMMENDATIONS, answerFormat, finalizeAnswer, type FinalAnswer } from './answer.js'
+import { MAX_RECOMMENDATIONS, answerFormat, finalizeAnswer, isShoppingAnswer, type FinalAnswer } from './answer.js'
 import type { CatalogPort } from './catalog-port.js'
 import { EvidenceLedger } from './ledger.js'
 import { AGENT_PROMPT_VERSION, agentContextPrompt, agentSystemPrompt } from './prompts.js'
@@ -23,11 +22,13 @@ export interface AgentTurnInput {
 }
 
 export interface AgentLimits {
-  /** Model calls per turn, including the final answer. */
+  /** Model calls per turn, retries and the final answer included. */
   maxModelCalls: number
   /** Tool executions per turn; extra calls get a "budget used" result. */
   maxToolCalls: number
   modelTimeoutMs: number
+  /** Wall time for the whole turn; each model call gets at most what is left of it. */
+  turnTimeoutMs: number
   maxTokens: number
 }
 
@@ -35,6 +36,7 @@ export const DEFAULT_AGENT_LIMITS: AgentLimits = Object.freeze({
   maxModelCalls: 4,
   maxToolCalls: 6,
   modelTimeoutMs: 20_000,
+  turnTimeoutMs: 45_000,
   maxTokens: 3_000,
 })
 
@@ -53,7 +55,8 @@ export interface AgentTrace {
   toolCalls: Array<{ name: string; ok: boolean; ms: number }>
   usage: ChatUsage
   latencyMs: number
-  droppedSentences: number
+  /** Picked refs or ingredient lookups that gave no fact (not in the data, or about a product not shown). */
+  droppedRefs: number
   droppedProducts: number
   failure: AgentFailure | null
 }
@@ -91,18 +94,6 @@ function failureFor(error: unknown): AgentFailure {
     return 'model-error'
   }
   return 'catalog-error'
-}
-
-async function chatOnceWithRetry(
-  model: ChatModel,
-  request: ChatRequest,
-): Promise<{ response: ChatResponse; calls: number }> {
-  try {
-    return { response: await model.chat(request), calls: 1 }
-  } catch (error) {
-    if (!(error instanceof MetaModelError) || !error.transient) throw error
-    return { response: await model.chat(request), calls: 2 }
-  }
 }
 
 function parseAnswer(content: string | null): unknown {
@@ -150,7 +141,7 @@ export async function runAgentTurn(deps: AgentDependencies, input: AgentTurnInpu
     toolCalls: [],
     usage: EMPTY_USAGE,
     latencyMs: 0,
-    droppedSentences: 0,
+    droppedRefs: 0,
     droppedProducts: 0,
     failure: null,
   }
@@ -172,24 +163,44 @@ export async function runAgentTurn(deps: AgentDependencies, input: AgentTurnInpu
       { role: 'user', content: input.message },
     ]
 
+    const deadline = startedAt + limits.turnTimeoutMs
+    // Every attempt counts against `maxModelCalls` before it is sent, a retry too, so a failed call is still counted.
+    // The last attempt the budget allows never offers tools, so the turn ends with an answer or a failure.
+    const callModel = async (wantTools: boolean): Promise<{ response: ChatResponse; final: boolean }> => {
+      let retried = false
+      for (;;) {
+        const final = !wantTools || trace.modelCalls >= limits.maxModelCalls - 1
+        const left = deadline - now()
+        if (left <= 0) throw new MetaModelError('timeout', `The turn ran past ${limits.turnTimeoutMs}ms`)
+        trace.modelCalls += 1
+        try {
+          const response = await deps.model.chat({
+            messages,
+            tools: final ? undefined : tools,
+            parallelToolCalls: true,
+            responseFormat: format,
+            reasoningEffort: 'low',
+            maxTokens: limits.maxTokens,
+            timeoutMs: Math.min(limits.modelTimeoutMs, left),
+          })
+          return { response, final }
+        } catch (error) {
+          // One immediate retry when the request itself was fine, if the budget still has a call.
+          const transient = error instanceof MetaModelError && error.transient
+          if (!transient || retried || trace.modelCalls >= limits.maxModelCalls) throw error
+          retried = true
+        }
+      }
+    }
+
     let raw: unknown = null
     let toolCount = 0
     let forceAnswer = false
-    for (let round = 0; round < limits.maxModelCalls; round += 1) {
-      const finalRound = forceAnswer || round === limits.maxModelCalls - 1 || toolCount >= limits.maxToolCalls
-      const { response, calls } = await chatOnceWithRetry(deps.model, {
-        messages,
-        tools: finalRound ? undefined : tools,
-        parallelToolCalls: true,
-        responseFormat: format,
-        reasoningEffort: 'low',
-        maxTokens: limits.maxTokens,
-        timeoutMs: limits.modelTimeoutMs,
-      })
-      trace.modelCalls += calls
+    while (trace.modelCalls < limits.maxModelCalls) {
+      const { response, final } = await callModel(!forceAnswer && toolCount < limits.maxToolCalls)
       trace.usage = addUsage(trace.usage, response.usage)
 
-      if (response.toolCalls.length && !finalRound) {
+      if (response.toolCalls.length && !final) {
         messages.push({ role: 'assistant', content: response.content, tool_calls: response.toolCalls })
         const outcomes = await Promise.all(
           response.toolCalls.map(async (call) => {
@@ -219,9 +230,10 @@ export async function runAgentTurn(deps: AgentDependencies, input: AgentTurnInpu
       }
 
       raw = parseAnswer(response.content)
-      if (raw !== null) break
-      if (finalRound) break
-      // Prose instead of JSON: ask once more for the answer only.
+      // JSON missing answer fields would reach `finalizeAnswer` as empty filters; treat it like prose.
+      if (raw !== null && !isShoppingAnswer(raw)) raw = null
+      if (raw !== null || final) break
+      // Prose instead of the JSON answer: ask once more for the answer only.
       messages.push({ role: 'assistant', content: response.content })
       messages.push({ role: 'user', content: 'Reply now with the JSON answer only.' })
       forceAnswer = true
@@ -229,7 +241,7 @@ export async function runAgentTurn(deps: AgentDependencies, input: AgentTurnInpu
 
     if (raw === null) return failed('invalid-answer')
     const answer = finalizeAnswer(raw, { ledger, vocabulary, currentProductId: current?.id ?? null })
-    trace.droppedSentences = answer.dropped.sentences
+    trace.droppedRefs = answer.dropped.refs
     trace.droppedProducts = answer.dropped.products
     trace.latencyMs = now() - startedAt
     const { dropped: _dropped, ...rest } = answer

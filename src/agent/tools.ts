@@ -187,7 +187,7 @@ export function describeProduct(product: ProductFacts): Record<string, unknown> 
             ref: scoreRef(product.id),
             ...(product.score.reasons?.length ? { reasons: product.score.reasons } : {}),
           }
-        : null,
+        : { value: null, ref: scoreRef(product.id) },
     valueBand: product.valueBand,
     fitTags: product.fitTags.length ? { tags: product.fitTags, ref: fitRef(product.id) } : null,
     keyIngredients: product.keyIngredients.length
@@ -281,7 +281,7 @@ async function findProducts(args: Record<string, unknown>, context: ToolContext)
         refs: [
           productRef(item.product.id),
           ...item.verdict.refs,
-          ...(item.product.score.status === 'scored' ? [scoreRef(item.product.id)] : []),
+          scoreRef(item.product.id),
           ...(item.product.fitTags.length ? [fitRef(item.product.id)] : []),
           ...(item.product.keyIngredients.length ? [keyIngredientsRef(item.product.id)] : []),
         ],

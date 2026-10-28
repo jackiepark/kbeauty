@@ -32,6 +32,15 @@ describe('matchLabel', () => {
     expect(match.candidates[0]?.product.id).toBe('mellow-oat-calming-cream')
   })
 
+  it('keeps the product words of a Latin name that carries the whole product name', async () => {
+    const match = await matchLabel(
+      createFixtureCatalog(),
+      read({ latinNames: ['Mellow Oat Calming Cream'], visibleText: ['멜로우', '오트 카밍 크림'] }),
+    )
+    expect(match.status).toBe('matched')
+    expect(match.candidates[0]?.product.id).toBe('mellow-oat-calming-cream')
+  })
+
   it('refuses skin photos and reports unreadable or unknown packages', async () => {
     const catalog = createFixtureCatalog()
     expect(await matchLabel(catalog, read({ kind: 'person-or-skin' }))).toEqual({
@@ -43,6 +52,19 @@ describe('matchLabel', () => {
     expect((await matchLabel(catalog, read({ brand: 'Unknown Brand', visibleText: ['Snail Mucin'] }))).status).toBe(
       'no-match',
     )
+  })
+
+  it('does not offer other products of the same brand for a product the catalog lacks', async () => {
+    const catalog = createFixtureCatalog()
+    // Shares the brand and "cream" with the barrier cream, but not the printed name.
+    const missing = await matchLabel(catalog, read({ brand: 'Aurora Lab', productName: 'Vitamin Glow Cream' }))
+    expect(missing).toEqual({ status: 'no-match', candidates: [] })
+    // A sibling of the same line with a different product type is a different product too.
+    const sibling = await matchLabel(catalog, read({ brand: 'Dewpoint', productName: 'Hyaluronic Water Toner' }))
+    expect(sibling.status).toBe('no-match')
+    // The printed name, even without the brand, still finds the product.
+    const named = await matchLabel(catalog, read({ productName: 'Ceramide Barrier Cream' }))
+    expect(named.candidates[0]?.product.id).toBe('aurora-ceramide-barrier-cream')
   })
 
   it('scores brand matches above word-only matches', () => {

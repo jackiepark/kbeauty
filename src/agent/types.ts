@@ -1,8 +1,9 @@
 /**
  * Verifiable shopping agent core.
  *
- * The model proposes (understands the request, reads a label, picks tools, words the answer); deterministic code
- * decides (which products exist, whether an avoided ingredient group is listed, which score a product has). This
+ * The model proposes (understands the request, reads a label, picks tools, picks which facts to show); deterministic
+ * code decides (which products exist, whether an avoided ingredient group is listed, which score a product has) and
+ * builds every fact the shopper sees, so no answer can state what the catalog does not. This
  * folder must stay catalog- and app-neutral: everything specific arrives through `CatalogPort`.
  */
 
@@ -111,11 +112,28 @@ export interface Verdict {
   refs: string[]
 }
 
-export interface Sentence {
-  text: string
-  refs: string[]
-}
+/**
+ * A fact the app shows. The model only picks the ref a fact comes from (or names an ingredient to look up); code
+ * builds the fact from catalog data under the final conditions, and the app words it. A fact can never contradict
+ * the data it came from.
+ */
+export type Fact =
+  /** The product lists an avoidance group; evidence names with their places in the printed list. */
+  | { kind: 'listed'; productId: string; code: string; evidence: EvidenceItem[] }
+  /** None of these avoided groups is listed in the product's printed list. */
+  | { kind: 'passes'; productId: string; checked: string[] }
+  /** No ingredient list to check. */
+  | { kind: 'unchecked'; productId: string }
+  | { kind: 'ingredient'; productId: string; name: string; position: number }
+  /** An ingredient the shopper asked about is not in the product's printed list. */
+  | { kind: 'absent'; productId: string; name: string }
+  | { kind: 'score'; productId: string; value: number; productType: string }
+  /** The product has not been scored yet. */
+  | { kind: 'unscored'; productId: string }
+  | { kind: 'fit'; productId: string; tags: string[] }
+  | { kind: 'key'; productId: string; names: string[] }
 
-export interface ProductNote extends Sentence {
+export interface ProductNote {
   productId: string
+  facts: Fact[]
 }

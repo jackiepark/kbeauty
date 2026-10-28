@@ -14,7 +14,8 @@ export class EvidenceLedger {
     const existing = this.products.get(product.id)
     if (!existing || existing.ingredients.status !== 'listed') this.products.set(product.id, product)
     this.refs.add(productRef(product.id))
-    if (product.score.status === 'scored' && product.score.value !== null) this.refs.add(scoreRef(product.id))
+    // An unscored product has a score ref too: picking it shows that it has not been scored yet.
+    this.refs.add(scoreRef(product.id))
     if (product.fitTags.length) this.refs.add(fitRef(product.id))
     if (product.keyIngredients.length) this.refs.add(keyIngredientsRef(product.id))
     for (const flag of product.flags.items) this.refs.add(flagRef(product.id, flag.code))

@@ -46,13 +46,11 @@ const finalBody = {
   },
   focusProductId: 'aurora-ceramide-barrier-cream',
   recommendedProductIds: ['mellow-oat-calming-cream', 'dewpoint-hyaluronic-cream'],
-  summary: [
-    { text: 'This cream lists Parfum at position 8, so it is out.', refs: ['ing:aurora-ceramide-barrier-cream#8'] },
-  ],
+  summaryRefs: ['ing:aurora-ceramide-barrier-cream#8'],
+  ingredientQueries: [],
   productNotes: [
     {
       productId: 'mellow-oat-calming-cream',
-      text: 'No listed fragrance and tagged for dry skin.',
       refs: ['check:mellow-oat-calming-cream', 'fit:mellow-oat-calming-cream'],
     },
   ],
@@ -102,7 +100,10 @@ describe('runAgentTurn', () => {
       'mellow-oat-calming-cream',
       'dewpoint-hyaluronic-cream',
     ])
-    expect(result.trace).toMatchObject({ modelCalls: 2, failure: null, droppedSentences: 0 })
+    expect(result.trace).toMatchObject({ modelCalls: 2, failure: null, droppedRefs: 0 })
+    expect(result.summary).toEqual([
+      { kind: 'ingredient', productId: 'aurora-ceramide-barrier-cream', name: 'Parfum', position: 8 },
+    ])
     expect(result.trace.toolCalls.map((call) => [call.name, call.ok])).toEqual([
       ['check_product', true],
       ['find_products', true],
@@ -210,7 +211,82 @@ describe('runAgentTurn', () => {
       { model: scriptedModel([new MetaModelError('timeout', 'slow')]), catalog: createFixtureCatalog() },
       { message: 'ok?', locale: 'en', currentProductId: null, previous: null },
     )
-    expect(timedOut).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout' } })
+    // The call that timed out was made, so it is counted.
+    expect(timedOut).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout', modelCalls: 1 } })
+  })
+
+  it('counts retries against the model-call budget and keeps tools off the last call', async () => {
+    const model = scriptedModel([
+      new MetaModelError('upstream', 'boom', 502),
+      {
+        content: null,
+        toolCalls: [toolCall('g1', 'get_product', { productId: 'mellow-oat-calming-cream' })],
+        finishReason: 'tool_calls',
+        usage,
+      },
+      new MetaModelError('network', 'reset'),
+      (request) => {
+        expect(request.tools).toBeUndefined()
+        return answer({ ...finalBody, recommendedProductIds: ['mellow-oat-calming-cream'] })
+      },
+    ])
+    const result = await runAgentTurn(
+      { model, catalog: createFixtureCatalog() },
+      { message: 'Tell me about the oat cream', locale: 'en', currentProductId: null, previous: null },
+    )
+    expect(result.status).toBe('answered')
+    expect(model.requests).toHaveLength(4)
+    expect(result.trace.modelCalls).toBe(4)
+  })
+
+  it('stops the turn at its wall-time limit and gives each call only the time left', async () => {
+    let clock = 0
+    const lookup = (id: string): ChatResponse => ({
+      content: null,
+      toolCalls: [toolCall(id, 'get_product', { productId: 'mellow-oat-calming-cream' })],
+      finishReason: 'tool_calls',
+      usage,
+    })
+    const model = scriptedModel([
+      (request) => {
+        expect(request.timeoutMs).toBe(20_000)
+        clock += 30_000
+        return lookup('g1')
+      },
+      (request) => {
+        expect(request.timeoutMs).toBe(15_000)
+        clock += 20_000
+        return lookup('g2')
+      },
+    ])
+    const result = await runAgentTurn(
+      { model, catalog: createFixtureCatalog(), now: () => clock, limits: { turnTimeoutMs: 45_000 } },
+      { message: 'Tell me about the oat cream', locale: 'en', currentProductId: null, previous: null },
+    )
+    expect(result).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout', modelCalls: 2 } })
+    expect(model.requests).toHaveLength(2)
+  })
+
+  it('keeps the earlier filters when the answer JSON is missing fields', async () => {
+    const previous = { conditions: finalBody.conditions as never, recommendedProductIds: [] }
+    const input = { message: 'ok?', locale: 'en', currentProductId: 'aurora-ceramide-barrier-cream', previous }
+    // An empty object once, then a proper answer: the turn asks again and answers under the real filters.
+    const recovered = await runAgentTurn(
+      { model: scriptedModel([answer({}), answer(finalBody)]), catalog: createFixtureCatalog() },
+      input,
+    )
+    expect(recovered.status).toBe('answered')
+    if (recovered.status === 'failed') throw new Error('unexpected failure')
+    expect(recovered.focus?.verdict.eligibility).toBe('excluded')
+
+    const model = scriptedModel([answer({}), answer({ ...finalBody, conditions: {} })])
+    const failed = await runAgentTurn({ model, catalog: createFixtureCatalog() }, input)
+    expect(failed).toMatchObject({
+      status: 'failed',
+      conditions: finalBody.conditions,
+      trace: { failure: 'invalid-answer', modelCalls: 2 },
+    })
+    expect(model.requests[1].messages.at(-1)).toEqual({ role: 'user', content: 'Reply now with the JSON answer only.' })
   })
 })
 
