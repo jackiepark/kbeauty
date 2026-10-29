@@ -41,6 +41,21 @@ describe('matchLabel', () => {
     expect(match.candidates[0]?.product.id).toBe('mellow-oat-calming-cream')
   })
 
+  it('ignores package sizes, which labels often print spaced and catalogs write joined', async () => {
+    const match = await matchLabel(
+      createFixtureCatalog(),
+      read({ brand: 'Aurora Lab', productName: 'Ceramide Barrier Cream 80 ml', visibleText: ['80 mL / 2.70 fl. oz.'] }),
+    )
+    expect(match.status).toBe('matched')
+    expect(match.candidates[0]?.product.id).toBe('aurora-ceramide-barrier-cream')
+    // A number that is part of the name is kept: only a number with a size unit is layout.
+    const named = await matchLabel(
+      createFixtureCatalog(),
+      read({ brand: 'Nightshift', productName: 'Retinal 0.1 Night Serum' }),
+    )
+    expect(named.candidates[0]?.product.id).toBe('nightshift-retinal-serum')
+  })
+
   it('refuses skin photos and reports unreadable or unknown packages', async () => {
     const catalog = createFixtureCatalog()
     expect(await matchLabel(catalog, read({ kind: 'person-or-skin' }))).toEqual({

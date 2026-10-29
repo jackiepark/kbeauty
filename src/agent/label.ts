@@ -125,6 +125,13 @@ function brandMatches(product: ProductFacts, brands: readonly string[]): boolean
   })
 }
 
+/**
+ * Package sizes and counts ("80 ml", "2.36 fl. oz.", "10P", "1 sheet"): print layout, not part of the name. Catalog
+ * names write them joined ("80ml") and labels often spaced, so they are removed from both sides before names meet.
+ */
+const PACKAGE_SIZE = /\d+(?:[.,]\d+)?\s*(?:fl\.?\s*oz|ml|mg|kg|g|l|oz|ea|pcs?|p|sheets?|매|개)(?![a-z])\.?/gi
+const withoutSizes = (text: string) => text.replace(PACKAGE_SIZE, ' ')
+
 const wordsMeet = (a: string, b: string) =>
   a === b || (b.length >= 4 && a.startsWith(b)) || (a.length >= 4 && b.startsWith(a))
 
@@ -139,15 +146,17 @@ export function nameCoverage(product: ProductFacts, read: LabelRead): number {
   const brandWords = new Set([...latinWords(read.brand), ...searchTokens(product.brand)])
   const distinct = (words: string[]) =>
     [...new Set(words)].filter((word) => !brandWords.has(word) && !LABEL_NOISE.has(word))
-  const printedName = distinct(latinWords([read.productName, ...read.latinNames].filter(Boolean).join(' ')))
-  const candidateWords = searchTokens(`${product.brand} ${product.name}`)
+  const printedName = distinct(
+    latinWords(withoutSizes([read.productName, ...read.latinNames].filter(Boolean).join(' '))),
+  )
+  const candidateWords = searchTokens(withoutSizes(`${product.brand} ${product.name}`))
   if (printedName.length) {
     const found = printedName.filter((word) => candidateWords.some((candidate) => wordsMeet(candidate, word)))
     return found.length / printedName.length
   }
   const nameWords = candidateWords.filter((word) => !brandWords.has(word))
   if (!nameWords.length) return 0
-  const labelWords = latinWords(read.visibleText.join(' '))
+  const labelWords = latinWords(withoutSizes(read.visibleText.join(' ')))
   const seen = nameWords.filter((word) => labelWords.some((label) => wordsMeet(word, label)))
   return seen.length / nameWords.length
 }
@@ -172,10 +181,10 @@ function latinWords(value: string | null | undefined): string[] {
 function searchQueries(read: LabelRead): Array<{ query: string; limit: number }> {
   const printedBrand = latinWords(read.brand)
   const brandWords = (printedBrand.length ? printedBrand : latinWords(read.latinNames[0])).slice(0, 3)
-  const nameWords = latinWords([read.productName, ...read.latinNames].filter(Boolean).join(' ')).filter(
+  const nameWords = latinWords(withoutSizes([read.productName, ...read.latinNames].filter(Boolean).join(' '))).filter(
     (word) => !brandWords.includes(word),
   )
-  const visibleWords = latinWords(read.visibleText.join(' '))
+  const visibleWords = latinWords(withoutSizes(read.visibleText.join(' ')))
     .filter((word) => !brandWords.includes(word) && !/^\d+$/.test(word))
     .sort((a, b) => b.length - a.length)
   const queries: Array<{ query: string; limit: number }> = []
