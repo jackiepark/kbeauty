@@ -18,6 +18,7 @@ The model proposes, deterministic code decides, and the model never writes a pro
 - One request carries both `tools` and a strict `response_format`. When the model calls tools, the agent runs them and records every fact in a per-turn evidence ledger; when it stops calling tools, the same request shape returns the final JSON answer.
 - `tool_choice` only accepts `auto` today, so the final round simply omits `tools` to force the JSON answer.
 - Reasoning tokens count against `max_tokens`; with the default effort a 300-token budget can return no content at all. Each call sets `reasoning_effort` explicitly.
+- A turn has 4 model calls, retries included, and 45 s of wall time. A server or network error, or a reply slower than the 20 s call timeout, is retried once while at least 5 s of the turn are left.
 
 ## Layout
 

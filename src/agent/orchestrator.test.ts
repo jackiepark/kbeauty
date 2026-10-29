@@ -196,23 +196,56 @@ describe('runAgentTurn', () => {
     expect(model.requests[1].messages.at(-1)).toEqual({ role: 'user', content: 'Reply now with the JSON answer only.' })
   })
 
-  it('retries one transient model failure and reports timeouts as failures', async () => {
+  it('retries a failed call once: server errors and slow replies, while the turn has time', async () => {
+    const input = { message: 'ok?', locale: 'en', currentProductId: 'aurora-ceramide-barrier-cream', previous: null }
     const retried = await runAgentTurn(
       {
         model: scriptedModel([new MetaModelError('upstream', 'boom', 502), answer(finalBody)]),
         catalog: createFixtureCatalog(),
       },
-      { message: 'ok?', locale: 'en', currentProductId: 'aurora-ceramide-barrier-cream', previous: null },
+      input,
     )
     expect(retried.status).toBe('answered')
     expect(retried.trace.modelCalls).toBe(2)
 
-    const timedOut = await runAgentTurn(
-      { model: scriptedModel([new MetaModelError('timeout', 'slow')]), catalog: createFixtureCatalog() },
-      { message: 'ok?', locale: 'en', currentProductId: null, previous: null },
+    // A reply slower than the call timeout is tried once more within the turn's time.
+    const slowOnce = await runAgentTurn(
+      {
+        model: scriptedModel([new MetaModelError('timeout', 'slow'), answer(finalBody)]),
+        catalog: createFixtureCatalog(),
+      },
+      input,
     )
-    // The call that timed out was made, so it is counted.
-    expect(timedOut).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout', modelCalls: 1 } })
+    expect(slowOnce.status).toBe('answered')
+    expect(slowOnce.trace.modelCalls).toBe(2)
+
+    // Only once per call: two slow replies end the turn, and both calls are counted.
+    const slowTwice = await runAgentTurn(
+      {
+        model: scriptedModel([new MetaModelError('timeout', 'slow'), new MetaModelError('timeout', 'slow')]),
+        catalog: createFixtureCatalog(),
+      },
+      input,
+    )
+    expect(slowTwice).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout', modelCalls: 2 } })
+
+    // No retry when less than `minRetryMs` of the turn is left.
+    let clock = 0
+    const late = await runAgentTurn(
+      {
+        model: scriptedModel([
+          () => {
+            clock += 41_000
+            throw new MetaModelError('timeout', 'slow')
+          },
+          answer(finalBody),
+        ]),
+        catalog: createFixtureCatalog(),
+        now: () => clock,
+      },
+      input,
+    )
+    expect(late).toMatchObject({ status: 'failed', trace: { failure: 'model-timeout', modelCalls: 1 } })
   })
 
   it('counts retries against the model-call budget and keeps tools off the last call', async () => {

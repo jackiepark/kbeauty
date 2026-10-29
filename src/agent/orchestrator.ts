@@ -29,6 +29,8 @@ export interface AgentLimits {
   modelTimeoutMs: number
   /** Wall time for the whole turn; each model call gets at most what is left of it. */
   turnTimeoutMs: number
+  /** A failed call is retried only when at least this much of the turn is left. */
+  minRetryMs: number
   maxTokens: number
 }
 
@@ -37,6 +39,7 @@ export const DEFAULT_AGENT_LIMITS: AgentLimits = Object.freeze({
   maxToolCalls: 6,
   modelTimeoutMs: 20_000,
   turnTimeoutMs: 45_000,
+  minRetryMs: 5_000,
   maxTokens: 3_000,
 })
 
@@ -185,9 +188,11 @@ export async function runAgentTurn(deps: AgentDependencies, input: AgentTurnInpu
           })
           return { response, final }
         } catch (error) {
-          // One immediate retry when the request itself was fine, if the budget still has a call.
-          const transient = error instanceof MetaModelError && error.transient
-          if (!transient || retried || trace.modelCalls >= limits.maxModelCalls) throw error
+          // One retry per call when the request itself was fine: a server or network error, or a reply slower than
+          // the call timeout. Only while the budget still has a call and the turn has time left for it.
+          const retriable = error instanceof MetaModelError && (error.transient || error.kind === 'timeout')
+          const outOfTime = deadline - now() < limits.minRetryMs
+          if (!retriable || retried || outOfTime || trace.modelCalls >= limits.maxModelCalls) throw error
           retried = true
         }
       }
